@@ -9,8 +9,13 @@
 //    L2 + R1    : estocada (gasta FP)
 //    O (circulo): toca = rodar (esquiva), mantener = correr
 //    X (cruz)   : saltar            CUADRADO : tomar lagrimas (curar)
-//    TRIANGULO  : interactuar (sitio de gracia)
+//    TRIANGULO  : interactuar (fogata de gracia / armeria / botica / gremio de misiones)
 //    START      : pausa
+//
+//  Flujo: PUEBLO pequeno (armeria, botica, gremio) -> gremio de misiones -> PANTALLA DE CARGA
+//         -> nivel de la mision (oleada de enemigos + jefe) -> de vuelta al pueblo.
+//  Solo hay UN nivel en memoria a la vez: begin_load() descarga el actual y
+//  construye el siguiente por etapas mientras se muestra la pantalla de carga.
 // ============================================================
 #include <tamtypes.h>
 #include <kernel.h>
@@ -52,12 +57,16 @@ extern unsigned int  size_freesd_irx;
 #define TP_F  6.2831853f
 #define NEAR_Z 0.15f
 #define CELL  6.0f
-#define WORLD_R 245.0f
 #define BLACK GS_SETREG_RGBAQ(0x00, 0x00, 0x00, 0x80, 0x00)
-#define FOG_R 206.0f
-#define FOG_G 184.0f
-#define FOG_B 138.0f
-#define SKYCOL GS_SETREG_RGBAQ(206, 184, 138, 0x80, 0x00)
+// la niebla y el cielo cambian por nivel (ver set_fog)
+static float fog_r = 206.0f, fog_g = 184.0f, fog_b = 138.0f;
+static u64 sky_col;
+#define SKYCOL sky_col
+static void set_fog(float r, float g, float b)
+{
+    fog_r = r; fog_g = g; fog_b = b;
+    sky_col = GS_SETREG_RGBAQ((int)r, (int)g, (int)b, 0x80, 0x00);
+}
 
 static GSGLOBAL *gsGlobal;
 static char padBuf[256] __attribute__((aligned(64)));
@@ -94,19 +103,32 @@ static const int   gfx_R[3]    = { 9, 12, 15 };
 static const float gfx_maxd[3] = { 58.0f, 80.0f, 104.0f };
 static const float gfx_tree[3] = { 42.0f, 60.0f, 82.0f };
 static const float gfx_fog1[3] = { 70.0f, 95.0f, 120.0f };
-enum { UI_MAIN, UI_OPT, UI_PLAY, UI_PAUSE, UI_GRACE };
-static int ui = UI_MAIN, menu_sel, opt_sel, opt_from = UI_MAIN, grace_sel;
+enum { UI_MAIN, UI_OPT, UI_PLAY, UI_PAUSE, UI_GRACE, UI_MISSION, UI_LOADING, UI_SHOP };
+static int ui = UI_MAIN, menu_sel, opt_sel, opt_from = UI_MAIN, grace_sel, mission_sel, shop_sel, shop_kind;
 
 // ---------------- terreno (alturas analiticas) ----------------
+#define COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
+// Cada nivel es solo DATOS: terreno plano, camino, ruinas, grupos de enemigos, gracias y jefe.
 typedef struct { float x, z, r0, r1, h; } Flat;
-static const Flat flats[] = {
-    {   0.0f,    0.0f, 15.0f, 32.0f, 2.0f },     // llanura inicial
-    { 116.0f,  -36.0f, 17.0f, 34.0f, 3.0f },     // fuerte
-    { 205.0f, -135.0f, 32.0f, 54.0f, 4.0f },     // castillo del jefe
-    { 172.0f, -126.0f,  9.0f, 20.0f, 3.8f },     // sitio de gracia junto al castillo
-    {  72.0f,   48.0f, 10.0f, 22.0f, 2.6f },
-};
-#define NFLAT ((int)(sizeof(flats) / sizeof(flats[0])))
+typedef struct { float x, z, yaw; int type; } RuinDef;
+typedef struct { const char *name; float hp, scale; int reward, pal; } BossDef;
+typedef struct {
+    const Flat *flats; int nflat;
+    const float (*road)[2]; int nroad;
+    const RuinDef *ruins; int nruin;
+    const float (*groups)[3]; int ngroups;     // x, z, cantidad de soldados
+    const float (*guards)[2]; int nguards;     // soldados sueltos (patio del jefe)
+    const float (*graces)[2]; int ngraces;     // sitios de gracia; el primero es el de inicio
+    float world_r, spawn_yaw, fog[3];
+    int tree_pct, boss, village;               // boss: indice en bosses[] o -1
+    float boss_x, boss_z;
+} Level;
+enum { LV_VILLAGE, LV_CASTLE, LV_CRYPT, LV_N };
+static const Level *L;                         // nivel cargado ahora mismo
+static const BossDef *bd;                      // jefe del nivel actual (NULL en el pueblo)
+static int cur_mission = -1;                   // -1 = estamos en el pueblo
+static int mission_done[8];
+static float clear_t;                          // segundos desde que cayo el jefe
 
 static float terrain_raw(float x, float z)
 {
@@ -118,24 +140,21 @@ static float terrain_raw(float x, float z)
 static float terrain_h(float x, float z)
 {
     float h = terrain_raw(x, z);
-    for (int i = 0; i < NFLAT; i++) {
-        float dx = x - flats[i].x, dz = z - flats[i].z;
-        float m = 1.0f - smoothf(flats[i].r0, flats[i].r1, sqrtf(dx * dx + dz * dz));
-        h = lerpf(h, flats[i].h, m);
+    for (int i = 0; i < L->nflat; i++) {
+        const Flat *f = &L->flats[i];
+        float dx = x - f->x, dz = z - f->z;
+        float m = 1.0f - smoothf(f->r0, f->r1, sqrtf(dx * dx + dz * dz));
+        h = lerpf(h, f->h, m);
     }
     return h;
 }
 
-// camino de tierra (se ve en el suelo y no crecen arboles encima)
-static const float road[][2] = {
-    {0, 0}, {40, 25}, {85, 35}, {112, -5}, {116, -36}, {150, -80}, {172, -100}, {174, -126}, {184, -135}
-};
-#define NROAD ((int)(sizeof(road) / sizeof(road[0])))
+// camino de tierra (se ve en el suelo y no crecen arboles encima); cada nivel trae el suyo
 static float road_dist(float x, float z)
 {
     float best = 1e9f;
-    for (int i = 0; i + 1 < NROAD; i++) {
-        float ax = road[i][0], az = road[i][1], bx = road[i + 1][0], bz = road[i + 1][1];
+    for (int i = 0; i + 1 < L->nroad; i++) {
+        float ax = L->road[i][0], az = L->road[i][1], bx = L->road[i + 1][0], bz = L->road[i + 1][1];
         float abx = bx - ax, abz = bz - az, t = ((x - ax) * abx + (z - az) * abz) / (abx * abx + abz * abz);
         t = clampf(t, 0.0f, 1.0f);
         float dx = x - (ax + abx * t), dz = z - (az + abz * t);
@@ -151,6 +170,14 @@ typedef struct { float x, z, yaw, hx, hz, y0, h, ext, cy, sy; unsigned char r, g
 static Box boxes[MAXBOX];
 static int nboxes;
 static int boss_gate_closed;
+// puntos de interaccion del pueblo (puertas de los 3 edificios) y tenderos
+enum { POI_ARMS, POI_POTION, POI_MISSION };
+typedef struct { float x, z; int kind; } Poi;
+static Poi pois[4]; static int npoi;
+typedef struct { float x, z, yaw; int pal; } Npc;
+static Npc npcs[8]; static int nnpc;
+static void add_poi(float x, float z, int kind) { if (npoi < 4) { pois[npoi].x = x; pois[npoi].z = z; pois[npoi].kind = kind; npoi++; } }
+static void add_npc(float x, float z, float yaw, int pal) { if (nnpc < 8) { npcs[nnpc].x = x; npcs[nnpc].z = z; npcs[nnpc].yaw = yaw; npcs[nnpc].pal = pal; nnpc++; } }
 static float gate_x, gate_z;                    // centro de la puerta de niebla del jefe
 
 static void add_box(float x, float z, float yaw, float hx, float hz, float h, float lift, int r, int g, int b, float emit)
@@ -166,6 +193,51 @@ static void add_box(float x, float z, float yaw, float hx, float hz, float h, fl
 #define ST1 128, 122, 110
 #define ST2 112, 106, 96
 #define ST3 96, 106, 82
+#define WL 176, 158, 126          // muros de casa
+#define RF 118, 62, 46            // techos
+
+// edificio importante 11x8: puerta de 3.2 m al frente (+z), mostrador, tendero y letrero luminoso.
+// kind = POI_ARMS / POI_POTION / POI_MISSION (cambia colores, accesorios y para que sirve)
+static void gen_building(float x, float z, float yaw, int kind)
+{
+    float cy = cosf(yaw), sy = sinf(yaw);
+    static const unsigned char wl[3][3] = { { 150, 150, 160 }, { 170, 190, 150 }, { 190, 165, 120 } };   // muros
+    static const unsigned char rf[3][3] = { {  70,  80, 104 }, {  60, 112,  72 }, { 124,  42,  42 } };   // techo
+    static const unsigned char sg[3][3] = { { 200, 214, 240 }, { 235,  80,  80 }, { 255, 212, 100 } };   // letrero y banderas
+    int wr = wl[kind][0], wg = wl[kind][1], wb = wl[kind][2];
+    int rr = rf[kind][0], rg = rf[kind][1], rb = rf[kind][2];
+    int sr = sg[kind][0], sgr = sg[kind][1], sb = sg[kind][2];
+    add_box(LP(0.0f, -4.0f), yaw, 5.9f, 0.4f, 3.6f, -0.4f, wr, wg, wb, 0);
+    add_box(LP(-5.5f, 0.0f), yaw, 0.4f, 4.4f, 3.6f, -0.4f, wr, wg, wb, 0);
+    add_box(LP(5.5f, 0.0f), yaw, 0.4f, 4.4f, 3.6f, -0.4f, wr, wg, wb, 0);
+    add_box(LP(-3.75f, 4.0f), yaw, 2.15f, 0.4f, 3.6f, -0.4f, wr, wg, wb, 0);       // frente con puerta de 3.2 m
+    add_box(LP(3.75f, 4.0f), yaw, 2.15f, 0.4f, 3.6f, -0.4f, wr, wg, wb, 0);
+    add_box(LP(0.0f, 0.0f), yaw, 6.5f, 5.2f, 0.5f, 3.2f, rr, rg, rb, 0);           // techo
+    add_box(LP(0.0f, 4.0f), yaw, 1.7f, 0.4f, 0.55f, 2.6f, wr, wg, wb, 0);          // dintel
+    add_box(LP(0.0f, 4.5f), yaw, 1.5f, 0.08f, 0.55f, 2.55f, sr, sgr, sb, 0.7f);    // letrero luminoso
+    for (int sd = -1; sd <= 1; sd += 2) {                                          // mastiles con bandera
+        add_box(LP(3.0f * sd, 5.4f), yaw, 0.1f, 0.1f, 4.4f, -0.4f, 70, 50, 36, 0);
+        add_box(LP(3.0f * sd, 5.4f), yaw, 0.55f, 0.04f, 1.3f, 2.6f, sr, sgr, sb, 0.45f);
+    }
+    add_box(LP(0.0f, -1.2f), yaw, 5.1f, 0.5f, 1.5f, -0.4f, 112, 78, 50, 0);        // mostrador de pared a pared
+    add_box(LP(-3.6f, -3.4f), yaw, 1.3f, 0.3f, 2.2f, -0.4f, 100, 70, 46, 0);       // estantes
+    add_box(LP(3.6f, -3.4f), yaw, 1.3f, 0.3f, 2.2f, -0.4f, 100, 70, 46, 0);
+    if (kind == POI_ARMS) {
+        for (int i = -1; i <= 1; i++) add_box(LP(1.4f * i, -3.6f), yaw, 0.06f, 0.06f, 1.8f, 0.3f, 200, 206, 220, 0.15f);   // lanzas y espadas
+        add_box(LP(-4.2f, 6.0f), yaw, 0.55f, 0.35f, 0.7f, -0.4f, 60, 60, 66, 0);                                         // yunque
+    } else if (kind == POI_POTION) {
+        add_box(LP(-1.8f, -1.2f), yaw, 0.15f, 0.15f, 0.35f, 1.55f, 230, 50, 60, 0.8f);                                   // frascos
+        add_box(LP(0.0f, -1.2f), yaw, 0.15f, 0.15f, 0.35f, 1.55f, 70, 110, 240, 0.8f);
+        add_box(LP(1.8f, -1.2f), yaw, 0.15f, 0.15f, 0.35f, 1.55f, 80, 220, 110, 0.8f);
+        add_box(LP(4.0f, 6.0f), yaw, 0.5f, 0.5f, 1.0f, -0.4f, 120, 80, 50, 0);                                           // barriles
+        add_box(LP(4.0f, 7.2f), yaw, 0.5f, 0.5f, 0.8f, -0.4f, 110, 74, 46, 0);
+    } else {
+        add_box(LP(0.0f, -3.7f), yaw, 1.8f, 0.05f, 1.6f, 0.6f, 140, 30, 30, 0.3f);                                        // estandarte
+        add_box(LP(-4.5f, 6.0f), yaw, 0.9f, 0.06f, 0.9f, 0.7f, 214, 192, 140, 0.35f);                                    // cartel de encargos
+    }
+    add_poi(LP(0.0f, 2.4f), kind);
+    add_npc(LP(0.0f, -2.9f), yaw, kind);
+}
 
 static void gen_ruin(int type, float x, float z, float yaw)
 {
@@ -233,10 +305,62 @@ static void gen_ruin(int type, float x, float z, float yaw)
             add_box(LP(-8.0f + (i % 3) * 8.0f, -10.0f + (i / 3) * 20.0f), yaw, 0.8f, 0.8f, 5.5f - (i & 1) * 1.5f, -0.6f, ST1, 0);
         gate_x = x + (-22.0f) * cy; gate_z = z - (-22.0f) * sy;
         break;
+    case 7: { // casita 6x6: puerta de 1.8 m al frente (+z), techo plano, ventana con luz
+        int v = ((int)floorf(x + z)) & 1;
+        int wr = v ? 168 : 182, wg = v ? 146 : 164, wb = v ? 112 : 128, rr = v ? 104 : 122, rg = v ? 70 : 76, rb = v ? 52 : 50;
+        add_box(LP(0.0f, -3.0f), yaw, 3.4f, 0.35f, 2.6f, -0.4f, wr, wg, wb, 0);
+        add_box(LP(-3.0f, 0.0f), yaw, 0.35f, 3.35f, 2.6f, -0.4f, wr, wg, wb, 0);
+        add_box(LP(3.0f, 0.0f), yaw, 0.35f, 3.35f, 2.6f, -0.4f, wr, wg, wb, 0);
+        add_box(LP(-2.15f, 3.0f), yaw, 1.25f, 0.35f, 2.6f, -0.4f, wr, wg, wb, 0);
+        add_box(LP(2.15f, 3.0f), yaw, 1.25f, 0.35f, 2.6f, -0.4f, wr, wg, wb, 0);
+        add_box(LP(0.0f, 0.0f), yaw, 3.9f, 3.9f, 0.5f, 2.2f, rr, rg, rb, 0);
+        add_box(LP(-2.15f, 3.42f), yaw, 0.45f, 0.05f, 0.5f, 1.5f, 255, 210, 120, 0.9f);       // ventana
+        break; }
+    case 9:  gen_building(x, z, yaw, POI_ARMS); break;       // armeria y armaduras
+    case 10: gen_building(x, z, yaw, POI_POTION); break;     // botica
+    case 11: gen_building(x, z, yaw, POI_MISSION); break;    // gremio de misiones
+    case 12:  // patio de la cripta (32x32, puerta al oeste, siempre con yaw 0 como el castillo)
+        add_box(LP(0.0f, -16.0f), yaw, 17.0f, 1.0f, 8.0f, -0.6f, ST3, 0);
+        add_box(LP(0.0f, 16.0f), yaw, 17.0f, 1.0f, 8.0f, -0.6f, ST3, 0);
+        add_box(LP(16.0f, 0.0f), yaw, 1.0f, 17.0f, 8.0f, -0.6f, ST2, 0);
+        add_box(LP(-16.0f, 10.0f), yaw, 1.0f, 6.5f, 8.0f, -0.6f, ST2, 0);
+        add_box(LP(-16.0f, -10.0f), yaw, 1.0f, 6.5f, 8.0f, -0.6f, ST2, 0);          // puerta de 5 m
+        add_box(LP(-16.0f, 4.2f), yaw, 1.6f, 1.6f, 11.0f, -0.6f, ST1, 0);
+        add_box(LP(-16.0f, -4.2f), yaw, 1.6f, 1.6f, 11.0f, -0.6f, ST1, 0);
+        for (int i = 0; i < 4; i++)
+            add_box(LP((i & 1) ? 16.0f : -16.0f, (i & 2) ? 16.0f : -16.0f), yaw, 2.4f, 2.4f, 13.0f, -0.6f, ST1, 0);
+        for (int i = 0; i < 4; i++)
+            add_box(LP((i & 1) ? 7.0f : -7.0f, (i & 2) ? 7.0f : -7.0f), yaw, 0.8f, 0.8f, 6.0f - (i & 1) * 1.5f, -0.6f, ST3, 0);
+        gate_x = x + (-16.0f) * cy; gate_z = z - (-16.0f) * sy;
+        break;
     }
 }
 
-static const struct { float x, z, yaw; int type; } ruins[] = {
+// =====================  DATOS DE LOS NIVELES  =====================
+// ---- PUEBLO pequeno: plaza con fogata, 5 casitas y 3 edificios importantes ----
+static const Flat flats_village[] = { { 0.0f, 0.0f, 40.0f, 60.0f, 2.0f } };
+static const float road_village[][2] = { { -36, 0 }, { 0, 0 }, { 0, 20 }, { 0, 0 }, { 36, 0 }, { 0, 0 }, { 0, -30 } };
+static const RuinDef ruins_village[] = {
+    {   0.0f,  26.0f,  3.1416f, 11 },     // GREMIO DE MISIONES (al fondo, frente a la plaza)
+    { -22.0f,  14.0f,  2.1346f,  9 },     // ARMERIA Y ARMADURAS (izquierda)
+    {  22.0f,  14.0f, -2.1346f, 10 },     // BOTICA (derecha)
+    { -28.0f,  -8.0f,  1.2924f,  7 }, {  28.0f,  -8.0f, -1.2924f, 7 },     // casitas mirando a la plaza
+    { -18.0f, -26.0f,  0.6057f,  7 }, {  18.0f, -26.0f, -0.6057f, 7 }, {   0.0f, -30.0f, 0.0f, 7 },
+};
+static const float graces_village[][2] = { { 0.0f, -2.0f } };       // fogata de la plaza
+
+// ---- MISION 1: EL PRESAGIO CAIDO (el mapa original: camino, fuerte y castillo) ----
+static const Flat flats_castle[] = {
+    {   0.0f,    0.0f, 15.0f, 32.0f, 2.0f },     // llanura inicial
+    { 116.0f,  -36.0f, 17.0f, 34.0f, 3.0f },     // fuerte
+    { 205.0f, -135.0f, 32.0f, 54.0f, 4.0f },     // castillo del jefe
+    { 172.0f, -126.0f,  9.0f, 20.0f, 3.8f },     // sitio de gracia junto al castillo
+    {  72.0f,   48.0f, 10.0f, 22.0f, 2.6f },
+};
+static const float road_castle[][2] = {
+    {0, 0}, {40, 25}, {85, 35}, {112, -5}, {116, -36}, {150, -80}, {172, -100}, {174, -126}, {184, -135}
+};
+static const RuinDef ruins_castle[] = {
     {   7.0f,  17.0f,  0.3f, 0 }, { -34.0f,  42.0f, 0.0f, 2 }, {  46.0f,  22.0f, 0.5f, 1 },
     {  72.0f,  48.0f,  0.0f, 3 }, {  96.0f,  62.0f, 0.4f, 4 }, { 116.0f, -36.0f, 0.0f, 5 },
     { 141.0f, -56.0f, -0.6f, 1 }, { 150.0f, -18.0f, 0.0f, 2 }, { 160.0f, -90.0f, -0.8f, 0 },
@@ -245,24 +369,86 @@ static const struct { float x, z, yaw; int type; } ruins[] = {
     { 140.0f,  44.0f,  0.9f, 4 }, { -92.0f,  22.0f, 1.2f, 0 }, { -50.0f,  96.0f, 0.0f, 3 },
     {  20.0f, 130.0f,  0.5f, 1 }, { 100.0f, -130.0f, 0.0f, 2 },
 };
-#define NRUIN ((int)(sizeof(ruins) / sizeof(ruins[0])))
+static const float groups_castle[][3] = {
+    { 46, 22, 2 }, { 72, 48, 3 }, { 96, 62, 2 }, { 116, -36, 4 }, { 150, -18, 3 }, { 160, -90, 3 },
+    { -34, 42, 2 }, { 30, -60, 3 }, { 62, 104, 2 }, { 141, -56, 2 }, { -62, -30, 2 }, { 84, -72, 2 },
+};
+static const float guards_castle[][2] = { { 194.0f, -148.5f }, { 206.0f, -139.5f }, { 194.0f, -130.5f }, { 206.0f, -121.5f } };
+static const float graces_castle[][2] = { { 0.0f, 7.0f }, { 110.0f, -38.0f }, { 176.0f, -128.0f } };
+
+// ---- MISION 2: LA CRIPTA OLVIDADA (mas corta, mas soldados, otro jefe) ----
+static const Flat flats_crypt[] = {
+    {   0.0f,   0.0f, 15.0f, 32.0f, 2.0f },
+    { 150.0f, -60.0f, 24.0f, 42.0f, 3.0f },     // patio de la cripta
+    { 120.0f, -58.0f,  8.0f, 18.0f, 3.2f },     // gracia frente a la puerta
+};
+static const float road_crypt[][2] = { {0, 0}, {30, -15}, {62, -30}, {92, -46}, {118, -58}, {132, -60} };
+static const RuinDef ruins_crypt[] = {
+    {  10.0f,  16.0f,  0.3f, 0 }, { -30.0f,  30.0f, 0.0f, 2 }, {  36.0f,  18.0f, 0.5f, 1 },
+    {  58.0f,  40.0f,  0.0f, 3 }, {  78.0f, -10.0f, 0.4f, 4 }, {  70.0f, -62.0f, -0.6f, 1 },
+    {  96.0f, -16.0f,  0.0f, 2 }, { 100.0f, -76.0f, -0.8f, 0 }, {  40.0f, -52.0f, 0.7f, 3 },
+    { -24.0f, -50.0f,  0.2f, 4 }, { -60.0f, -10.0f, 0.0f, 3 }, { 112.0f,  22.0f, 0.9f, 5 },
+    {  20.0f,  70.0f,  0.0f, 2 }, { 150.0f, -60.0f, 0.0f, 12 },
+};
+static const float groups_crypt[][3] = {
+    { 36, 18, 2 }, { 58, 40, 3 }, { 78, -10, 3 }, { 70, -62, 2 }, { 96, -16, 3 }, { 100, -76, 3 },
+    { 40, -52, 2 }, { 112, 22, 4 }, { -30, 30, 2 }, { 20, 70, 2 }, { -24, -50, 2 },
+};
+static const float guards_crypt[][2] = { { 146.0f, -68.0f }, { 146.0f, -52.0f } };
+static const float graces_crypt[][2] = { { 0.0f, 7.0f }, { 84.0f, -24.0f }, { 118.0f, -58.0f } };
+
+static const BossDef bosses[] = {
+    { "PRESAGIO CAIDO",        900.0f, 2.0f, 1800, 0 },
+    { "GUARDIAN DE LA CRIPTA", 1300.0f, 2.2f, 2800, 1 },
+};
+
+static const Level levels[LV_N] = {
+    [LV_VILLAGE] = {
+        .flats = flats_village, .nflat = COUNT(flats_village), .road = road_village, .nroad = COUNT(road_village),
+        .ruins = ruins_village, .nruin = COUNT(ruins_village), .graces = graces_village, .ngraces = COUNT(graces_village),
+        .world_r = 46.0f, .spawn_yaw = -0.09f, .fog = { 206.0f, 184.0f, 138.0f }, .tree_pct = 35, .boss = -1, .village = 1,
+    },
+    [LV_CASTLE] = {
+        .flats = flats_castle, .nflat = COUNT(flats_castle), .road = road_castle, .nroad = COUNT(road_castle),
+        .ruins = ruins_castle, .nruin = COUNT(ruins_castle), .groups = groups_castle, .ngroups = COUNT(groups_castle),
+        .guards = guards_castle, .nguards = COUNT(guards_castle), .graces = graces_castle, .ngraces = COUNT(graces_castle),
+        .world_r = 245.0f, .spawn_yaw = 2.3f, .fog = { 206.0f, 184.0f, 138.0f }, .tree_pct = 30,
+        .boss = 0, .boss_x = 212.0f, .boss_z = -135.0f,
+    },
+    [LV_CRYPT] = {
+        .flats = flats_crypt, .nflat = COUNT(flats_crypt), .road = road_crypt, .nroad = COUNT(road_crypt),
+        .ruins = ruins_crypt, .nruin = COUNT(ruins_crypt), .groups = groups_crypt, .ngroups = COUNT(groups_crypt),
+        .guards = guards_crypt, .nguards = COUNT(guards_crypt), .graces = graces_crypt, .ngraces = COUNT(graces_crypt),
+        .world_r = 200.0f, .spawn_yaw = 2.3f, .fog = { 150.0f, 162.0f, 178.0f }, .tree_pct = 24,
+        .boss = 1, .boss_x = 158.0f, .boss_z = -60.0f,
+    },
+};
+
+// ---- misiones del tablon (para agregar una: nuevo Level + nueva fila aqui) ----
+typedef struct { const char *title, *d1, *d2; int level; } Mission;
+static const Mission missions[] = {
+    { "EL PRESAGIO CAIDO",    "SIGUE EL CAMINO DE CENIZA HASTA EL CASTILLO",  "Y ENFRENTA AL JEFE DE LA FORTALEZA.", LV_CASTLE },
+    { "LA CRIPTA OLVIDADA",   "ABRETE PASO ENTRE UNA OLEADA DE SOLDADOS",     "HASTA LA CRIPTA DE SU GUARDIAN.",     LV_CRYPT },
+};
+#define NMISSION COUNT(missions)
 
 // ---------------- arboles (por celda, deterministas) ----------------
 static int tree_info(int cx, int cz, float *tx, float *tz, float *sc, int *kind)
 {
     unsigned int h = hash2(cx, cz);
-    if ((h % 100) >= 30) return 0;
+    if ((int)(h % 100) >= L->tree_pct) return 0;
     float x = cx * CELL + 0.7f + ((h >> 8) & 255) / 255.0f * (CELL - 1.4f);
     float z = cz * CELL + 0.7f + ((h >> 16) & 255) / 255.0f * (CELL - 1.4f);
-    if (fabsf(x) > WORLD_R - 4.0f || fabsf(z) > WORLD_R - 4.0f) return 0;
+    if (fabsf(x) > L->world_r - 4.0f || fabsf(z) > L->world_r - 4.0f) return 0;
     if (road_dist(x, z) < 4.2f) return 0;
-    for (int i = 0; i < NFLAT; i++) {
-        float dx = x - flats[i].x, dz = z - flats[i].z;
-        if (sqrtf(dx * dx + dz * dz) < flats[i].r0 + 2.0f) return 0;
+    for (int i = 0; i < L->nflat; i++) {
+        float dx = x - L->flats[i].x, dz = z - L->flats[i].z;
+        if (sqrtf(dx * dx + dz * dz) < L->flats[i].r0 + 2.0f) return 0;
     }
-    for (int i = 0; i < NRUIN; i++) {
-        float dx = x - ruins[i].x, dz = z - ruins[i].z;
-        float lim = (ruins[i].type == 6) ? 34.0f : (ruins[i].type == 5 ? 15.0f : 9.0f);
+    for (int i = 0; i < L->nruin; i++) {
+        const RuinDef *r = &L->ruins[i];
+        float dx = x - r->x, dz = z - r->z;
+        float lim = (r->type == 6) ? 34.0f : (r->type == 12 ? 26.0f : (r->type == 5 ? 15.0f : 9.0f));
         if (dx * dx + dz * dz < lim * lim) return 0;
     }
     *tx = x; *tz = z; *sc = 0.8f + ((h >> 24) & 63) / 63.0f * 0.7f;
@@ -295,9 +481,9 @@ static V mk(float wx, float wy, float wz, const float *c, float shade, float emi
     float d = sqrtf(dx * dx + dy * dy + dz * dz);
     float f = sky_mode ? 0.30f : smoothf(fog_far * 0.38f, fog_far, d);
     float l = shade + emit;
-    v.r = c[0] * l * (1.0f - f) + FOG_R * f;
-    v.g = c[1] * l * (1.0f - f) + FOG_G * f;
-    v.b = c[2] * l * (1.0f - f) + FOG_B * f;
+    v.r = c[0] * l * (1.0f - f) + fog_r * f;
+    v.g = c[1] * l * (1.0f - f) + fog_g * f;
+    v.b = c[2] * l * (1.0f - f) + fog_b * f;
     return v;
 }
 static V lerpv(V a, V b, float t)
@@ -457,10 +643,22 @@ typedef struct { float body[3], armor[3], cloth[3], skin[3], metal[3], accent[3]
 static const Pal PAL_P = { {74,68,64}, {98,102,114}, {124,38,34}, {214,170,130}, {200,204,214}, {222,182,70} };
 static const Pal PAL_S = { {88,66,52}, {120,94,72}, {98,42,38}, {190,150,120}, {152,152,158}, {172,122,60} };
 static const Pal PAL_B = { {70,52,36}, {152,122,62}, {52,30,72}, {200,160,120}, {172,172,182}, {232,192,80} };
+static const Pal PAL_PA[4] = {                 // jugador segun armadura (0 = ropa de viaje)
+    { {74,68,64},  {98,102,114},  {124,38,34}, {214,170,130}, {200,204,214}, {222,182,70} },
+    { {82,62,46},  {138,98,62},   {110,46,36}, {214,170,130}, {200,204,214}, {222,182,70} },
+    { {70,74,84},  {150,156,170}, {120,40,36}, {214,170,130}, {214,218,228}, {222,182,70} },
+    { {60,64,80},  {206,210,224}, {150,30,30}, {214,170,130}, {235,238,248}, {240,200,80} },
+};
+static const Pal PAL_N[3] = {                  // tenderos: armero, boticario, gremio
+    { {70,62,54},  {96,98,108},   {60,60,70},  {200,160,125}, {190,194,204}, {180,180,200} },
+    { {76,92,66},  {110,150,96},  {50,110,70}, {210,170,135}, {200,204,214}, {230,80,80} },
+    { {88,50,44},  {150,60,56},   {126,36,36}, {205,165,125}, {200,204,214}, {250,210,100} },
+};
+static const Pal PAL_B2 = { {44,56,74}, {104,122,150}, {28,44,72}, {170,190,200}, {196,206,220}, {110,205,235} };
 typedef struct {
     float ph, sp, lean, bpitch, drop, twist, cape, glow;
     float ra_p, ra_r, la_p, la_r;      // brazos (pitch positivo = hacia adelante, roll = hacia afuera)
-    int arm_ovr, weapon, shield, tuck;
+    int arm_ovr, weapon, shield, tuck, wtier;
 } Rig;
 
 static void part(const Xf *X, float cx, float cy, float cz, float hx, float hy, float hz, const float *col, float emit)
@@ -512,7 +710,8 @@ static void draw_rig(float x, float y, float z, float yaw, float s, const Rig *R
         part(&A, 0.31f * sd * s, 1.21f * s, 0.0f, 0.07f * s, 0.31f * s, 0.07f * s, Pl->armor, em);
         part(&A, 0.31f * sd * s, 0.88f * s, 0.0f, 0.06f * s, 0.06f * s, 0.06f * s, Pl->skin, em);
         if (sd > 0 && R->weapon == 0) {
-            part(&A, 0.31f * s, 0.88f * s, 0.46f * s, 0.022f * s, 0.05f * s, 0.46f * s, Pl->metal, em);
+            float bl = 0.46f + 0.09f * R->wtier, bw = 0.022f + 0.012f * R->wtier;      // mejor arma = hoja mas larga y ancha
+            part(&A, 0.31f * s, 0.88f * s, bl * s, bw * s, (0.05f + 0.015f * R->wtier) * s, bl * s, Pl->metal, em);
             part(&A, 0.31f * s, 0.88f * s, 0.06f * s, 0.14f * s, 0.03f * s, 0.025f * s, Pl->accent, em);
         } else if (sd > 0 && R->weapon == 2) {
             part(&A, 0.31f * s, 0.88f * s, 0.70f * s, 0.035f * s, 0.035f * s, 0.75f * s, Pl->body, em);
@@ -525,8 +724,9 @@ static void draw_rig(float x, float y, float z, float yaw, float s, const Rig *R
 
 // ---------------- mundo: pickups, gracias, enemigos ----------------
 typedef struct { float x, z; int active; } Grace;
-static Grace graces[3] = { { 0.0f, 7.0f, 1 }, { 110.0f, -38.0f, 0 }, { 176.0f, -128.0f, 0 } };
-#define NGRACE 3
+#define MAXGRACE 4
+static Grace graces[MAXGRACE];
+static int ngrace;
 #define MAXPK 24
 static float pk_x[MAXPK], pk_z[MAXPK]; static int pk_val[MAXPK], pk_got[MAXPK], npk;
 
@@ -546,8 +746,8 @@ static void spawn_enemy(int type, float x, float z)
     memset(e, 0, sizeof(*e));
     e->type = type; e->alive = 1; e->x = e->hx = x; e->z = e->hz = z; e->y = terrain_h(x, z);
     e->yaw = frand() * TP_F; e->st = ES_IDLE;
-    e->scale = type ? 2.0f : 1.0f;
-    e->hpmax = e->hp = type ? 900.0f : 100.0f;
+    e->scale = type ? bd->scale : 1.0f;
+    e->hpmax = e->hp = type ? bd->hp : 100.0f;
     if (type) boss_idx = nen;
     nen++;
 }
@@ -559,8 +759,14 @@ typedef struct {
     float circ_t, stag_t, flash, dead_t, flask_heal_t, hurt_t;
     unsigned char hitmask[MAXE];
     int respawn_grace;
+    int wpn, arm, flask_max, heal_lv;                // equipo y frascos (se compran en el pueblo)
+    unsigned char wown[4], aown[4];
 } Player;
 static Player P;
+// ---- equipo de la armeria: val = multiplicador de dano (armas) o de dano recibido (armaduras) ----
+typedef struct { const char *name; int price; float val; } Gear;
+static const Gear weapons[4] = { { "ESPADA CORTA", 0, 1.00f }, { "ESPADA LARGA", 400, 1.25f }, { "HACHA DE GUERRA", 900, 1.55f }, { "MANDOBLE DE CENIZA", 1800, 2.00f } };
+static const Gear armors[4]  = { { "ROPA DE VIAJE", 0, 1.00f }, { "CUERO REFORZADO", 300, 0.88f }, { "COTA DE MALLA", 800, 0.75f }, { "ARMADURA DE PLACAS", 1800, 0.60f } };
 enum { PS_NORMAL, PS_ROLL, PS_ATK, PS_FLASK, PS_STAG, PS_DEAD };
 typedef struct { float dur, h0, h1, reach, arc, dmg, sta, move; } Atk;
 static const Atk atks[5] = {
@@ -573,26 +779,54 @@ static const Atk atks[5] = {
 static char banner[40]; static float banner_t; static int banner_gold = 1;
 static void set_banner(const char *s, int gold) { strncpy(banner, s, sizeof(banner) - 1); banner[sizeof(banner) - 1] = 0; banner_t = 3.2f; banner_gold = gold; }
 
-static void gen_world(void)
+// ---------------- construccion de niveles (por etapas) ----------------
+static void level_unload(void)               // etapa 0: libera el nivel anterior
 {
     nboxes = 0; nen = 0; boss_idx = -1; boss_dead = 0; npk = 0; boss_gate_closed = 0;
-    for (int i = 0; i < NRUIN; i++) gen_ruin(ruins[i].type, ruins[i].x, ruins[i].z, ruins[i].yaw);
-    static const float grp[][3] = {
-        { 46, 22, 2 }, { 72, 48, 3 }, { 96, 62, 2 }, { 116, -36, 4 }, { 150, -18, 3 }, { 160, -90, 3 },
-        { -34, 42, 2 }, { 30, -60, 3 }, { 62, 104, 2 }, { 141, -56, 2 }, { -62, -30, 2 }, { 84, -72, 2 },
-    };
-    for (int i = 0; i < (int)(sizeof(grp) / sizeof(grp[0])); i++)
-        for (int k = 0; k < (int)grp[i][2]; k++) {
-            float a = k * TP_F / grp[i][2] + i, r = 2.5f + k * 0.9f;
-            spawn_enemy(0, grp[i][0] + sinf(a) * r, grp[i][1] + cosf(a) * r);
+    npoi = 0; nnpc = 0; ngrace = 0; bd = NULL; P.lock = -1;
+}
+static void level_select(int id)             // etapa 1: datos del nivel, niebla, gracias, jefe
+{
+    L = &levels[id];
+    set_fog(L->fog[0], L->fog[1], L->fog[2]);
+    ngrace = L->ngraces > MAXGRACE ? MAXGRACE : L->ngraces;
+    for (int i = 0; i < ngrace; i++) { graces[i].x = L->graces[i][0]; graces[i].z = L->graces[i][1]; graces[i].active = (i == 0); }
+    bd = L->boss >= 0 ? &bosses[L->boss] : NULL;
+}
+static void level_build_ruins(void)          // etapa 2: ruinas, casas, tablon, muralla
+{
+    for (int i = 0; i < L->nruin; i++) gen_ruin(L->ruins[i].type, L->ruins[i].x, L->ruins[i].z, L->ruins[i].yaw);
+    if (L->village) {                        // muralla circular alrededor del pueblo
+        const int n = 18; const float R = 38.0f;
+        for (int i = 0; i < n; i++) {
+            float a = i * TP_F / n;
+            add_box(sinf(a) * R, cosf(a) * R, a, 6.9f, 1.0f, 5.0f, -0.4f, ST1, 0);
         }
-    for (int k = 0; k < 4; k++) spawn_enemy(0, 200.0f + (k & 1) * 12.0f - 6.0f, -135.0f + (k - 1.5f) * 9.0f);
-    spawn_enemy(1, 212.0f, -135.0f);                       // el jefe, al fondo del patio
-    for (int i = 0; i < NRUIN && npk < MAXPK; i++) {
-        if (ruins[i].type == 6) continue;
-        pk_x[npk] = ruins[i].x + 3.5f; pk_z[npk] = ruins[i].z + 3.5f;
+    }
+}
+static void level_spawn_enemies(void)        // etapa 3: soldados, custodios y jefe
+{
+    for (int i = 0; i < L->ngroups; i++)
+        for (int k = 0; k < (int)L->groups[i][2]; k++) {
+            float a = k * TP_F / L->groups[i][2] + i, r = 2.5f + k * 0.9f;
+            spawn_enemy(0, L->groups[i][0] + sinf(a) * r, L->groups[i][1] + cosf(a) * r);
+        }
+    for (int k = 0; k < L->nguards; k++) spawn_enemy(0, L->guards[k][0], L->guards[k][1]);
+    if (L->boss >= 0) spawn_enemy(1, L->boss_x, L->boss_z);       // el jefe, al fondo del patio
+}
+static void level_place_items(void)          // etapa 4: runas en el suelo
+{
+    if (L->village) return;
+    for (int i = 0; i < L->nruin && npk < MAXPK; i++) {
+        int t = L->ruins[i].type;
+        if (t == 6 || t == 12) continue;
+        pk_x[npk] = L->ruins[i].x + 3.5f; pk_z[npk] = L->ruins[i].z + 3.5f;
         pk_val[npk] = 80 + (int)(hash2(i, 77) % 260); pk_got[npk] = 0; npk++;
     }
+}
+static void load_level_now(int id)           // todo de golpe (menu principal / arranque)
+{
+    level_unload(); level_select(id); level_build_ruins(); level_spawn_enemies(); level_place_items();
 }
 
 // ---------------- colisiones ----------------
@@ -604,7 +838,7 @@ static int box_hit(const Box *B, float x, float z, float r)
 }
 static int world_blocked(float x, float z, float r, float yfeet)
 {
-    if (fabsf(x) > WORLD_R || fabsf(z) > WORLD_R) return 1;
+    if (fabsf(x) > L->world_r || fabsf(z) > L->world_r) return 1;
     int cx = (int)floorf(x / CELL), cz = (int)floorf(z / CELL);
     for (int dz = -1; dz <= 1; dz++) for (int dx = -1; dx <= 1; dx++) {
         float tx, tz, sc; int k;
@@ -652,7 +886,8 @@ static void sfx_play(int id, float vol);
 // ---------------- jugador ----------------
 static void player_reset_stats(void)
 {
-    P.hpmax = 300.0f; P.fpmax = 80.0f; P.stamax = 100.0f; P.flasks = 4; P.runes = 0; P.level = 1; P.dmg_mult = 1.0f;
+    P.hpmax = 300.0f; P.fpmax = 80.0f; P.stamax = 100.0f; P.flask_max = 4; P.flasks = 4; P.heal_lv = 0; P.runes = 300; P.level = 1; P.dmg_mult = 1.0f;
+    P.wpn = 0; P.arm = 0; memset(P.wown, 0, sizeof(P.wown)); memset(P.aown, 0, sizeof(P.aown)); P.wown[0] = P.aown[0] = 1;
 }
 static void respawn_enemies(void)
 {
@@ -667,7 +902,7 @@ static void respawn_enemies(void)
 static void player_spawn_at_grace(int gi)
 {
     P.x = graces[gi].x + 2.5f; P.z = graces[gi].z; P.y = terrain_h(P.x, P.z); P.yaw = 2.3f; P.vy = 0; P.on_ground = 1;
-    P.hp = P.hpmax; P.fp = P.fpmax; P.sta = P.stamax; P.flasks = 4;
+    P.hp = P.hpmax; P.fp = P.fpmax; P.sta = P.stamax; P.flasks = P.flask_max;
     P.state = PS_NORMAL; P.st_t = 0; P.lock = -1; P.iframes = 0; P.guard = 0; P.dead_t = 0; P.respawn_grace = gi;
 }
 static void player_die(void)
@@ -687,6 +922,7 @@ static void player_hit(float dmg, float fx_, float fz_)
             P.sta_delay = 1.0f;
         }
     }
+    dmg *= armors[P.arm].val;
     P.hp -= dmg; P.flash = 0.18f; P.hurt_t = 0.5f;
     sfx_play(SFX_HIT, 0.9f);
     if (P.hp <= 0.0f) { player_die(); return; }
@@ -695,10 +931,10 @@ static void player_hit(float dmg, float fx_, float fz_)
 static void enemy_kill(Enemy *e)
 {
     e->alive = 0; e->st = ES_DEAD; e->t = 0.0f;
-    int reward = e->type ? 1800 : 70 + (int)(hash2((int)e->hx, (int)e->hz) % 50);
+    int reward = e->type ? bd->reward : 70 + (int)(hash2((int)e->hx, (int)e->hz) % 50);
     P.runes += reward;
     char b[40];
-    if (e->type) { boss_dead = 1; boss_gate_closed = 0; set_banner("GRAN ENEMIGO ABATIDO", 1); sfx_play(SFX_GRACE, 1.0f); }
+    if (e->type) { boss_dead = 1; boss_gate_closed = 0; if (cur_mission >= 0) mission_done[cur_mission] = 1; set_banner("GRAN ENEMIGO ABATIDO", 1); sfx_play(SFX_GRACE, 1.0f); }
     else { snprintf(b, sizeof(b), "ENEMIGO ABATIDO  +%d", reward); set_banner(b, 1); }
 }
 static void player_attack_hit(const Atk *a)
@@ -710,7 +946,7 @@ static void player_attack_hit(const Atk *a)
         if (d > a->reach + 0.5f * e->scale) continue;
         if (fabsf(angdiff(P.yaw, atan2f(dx, dz))) > a->arc) continue;
         P.hitmask[i] = 1;
-        e->hp -= a->dmg * P.dmg_mult; e->flash = 0.15f; e->hurt_t = 4.0f; e->aggro = 1;
+        e->hp -= a->dmg * P.dmg_mult * weapons[P.wpn].val; e->flash = 0.15f; e->hurt_t = 4.0f; e->aggro = 1;
         sfx_play(SFX_HIT, 0.8f);
         if (e->hp <= 0.0f) { enemy_kill(e); continue; }
         if (!e->type && (a->dmg >= 50.0f || frand() < 0.45f)) { e->st = ES_STAG; e->t = 0; e->stag = 0.55f; }
@@ -827,7 +1063,7 @@ static void player_update(const Input *in, float dt)
     case PS_FLASK:
         P.st_t += dt;
         mvx = mx * 1.3f * mag; mvz = mz * 1.3f * mag;
-        if (P.st_t > 0.55f && P.flask_heal_t == 0.0f) { P.flask_heal_t = 1.0f; P.hp = fminf(P.hpmax, P.hp + 150.0f); }
+        if (P.st_t > 0.55f && P.flask_heal_t == 0.0f) { P.flask_heal_t = 1.0f; P.hp = fminf(P.hpmax, P.hp + 150.0f + 40.0f * P.heal_lv); }
         if (P.st_t > 1.1f) P.state = PS_NORMAL;
         break;
     case PS_STAG:
@@ -1256,7 +1492,7 @@ static void draw_erdtree(void)
 }
 static void draw_misc(float t)
 {
-    for (int i = 0; i < NGRACE; i++) {
+    for (int i = 0; i < ngrace; i++) {
         if (!in_view(graces[i].x, graces[i].z, 3.0f, gfx_maxd[gfx])) continue;
         float y = terrain_h(graces[i].x, graces[i].z);
         float base[3] = { 160, 150, 130 }, glow[3] = { 255, 224, 140 };
@@ -1298,7 +1534,7 @@ static void enemy_rig(const Enemy *e, Rig *R)
 static void player_rig(Rig *R)
 {
     memset(R, 0, sizeof(*R));
-    R->weapon = 0; R->shield = 1; R->ph = P.walk_ph; R->sp = clampf(P.speed / 6.6f, 0.0f, 1.0f);
+    R->weapon = 0; R->wtier = P.wpn; R->shield = 1; R->ph = P.walk_ph; R->sp = clampf(P.speed / 6.6f, 0.0f, 1.0f);
     R->lean = 0.14f * R->sp + (P.speed > 5.0f ? 0.12f : 0.0f); R->glow = P.flash > 0.0f ? 0.6f : 0.0f; R->cape = 0.25f * R->sp;
     switch (P.state) {
     case PS_NORMAL:
@@ -1326,10 +1562,16 @@ static void draw_characters(void)
         const Enemy *e = &en[i];
         if (!in_view(e->x, e->z, 3.0f, gfx_maxd[gfx])) continue;
         Rig R; enemy_rig(e, &R);
-        draw_rig(e->x, e->y, e->z, e->yaw, e->scale, &R, e->type ? &PAL_B : &PAL_S);
+        draw_rig(e->x, e->y, e->z, e->yaw, e->scale, &R, e->type ? (bd && bd->pal ? &PAL_B2 : &PAL_B) : &PAL_S);
+    }
+    for (int i = 0; i < nnpc; i++) {                      // tenderos tras el mostrador
+        if (!in_view(npcs[i].x, npcs[i].z, 2.0f, gfx_maxd[gfx])) continue;
+        Rig N; memset(&N, 0, sizeof(N));
+        N.arm_ovr = 1; N.ra_p = 0.3f; N.la_p = 0.3f; N.ra_r = 0.12f; N.la_r = 0.12f; N.weapon = 1;
+        draw_rig(npcs[i].x, terrain_h(npcs[i].x, npcs[i].z), npcs[i].z, npcs[i].yaw, 1.0f, &N, &PAL_N[npcs[i].pal]);
     }
     Rig R; player_rig(&R);
-    draw_rig(P.x, P.y, P.z, P.yaw, 1.0f, &R, &PAL_P);
+    draw_rig(P.x, P.y, P.z, P.yaw, 1.0f, &R, &PAL_PA[P.arm]);
 }
 static void render_scene(float t)
 {
@@ -1354,7 +1596,16 @@ static void bar(float x, float y, float w, float h, float frac, u64 col, u64 bg)
 }
 static int near_grace(void)
 {
-    for (int i = 0; i < NGRACE; i++) { float dx = P.x - graces[i].x, dz = P.z - graces[i].z; if (dx * dx + dz * dz < 3.4f * 3.4f) return i; }
+    for (int i = 0; i < ngrace; i++) { float dx = P.x - graces[i].x, dz = P.z - graces[i].z; if (dx * dx + dz * dz < 3.4f * 3.4f) return i; }
+    return -1;
+}
+static const char *const poi_name[3] = { "ARMERIA", "BOTICA", "GREMIO DE MISIONES" };
+static int near_poi(void)                    // tipo de edificio cuya puerta tienes cerca, o -1
+{
+    for (int i = 0; i < npoi; i++) {
+        float dx = P.x - pois[i].x, dz = P.z - pois[i].z;
+        if (dx * dx + dz * dz < 4.0f * 4.0f) return pois[i].kind;
+    }
     return -1;
 }
 static void draw_hud(void)
@@ -1369,6 +1620,10 @@ static void draw_hud(void)
     if (banner_t > 0.0f) draw_text_sh((W - text_w(banner, 3)) * 0.5f, H * 0.66f, banner, 3, banner_gold ? RGB(246, 214, 120) : RGB(200, 60, 50));
     int gi = near_grace();
     if (gi >= 0 && P.state != PS_DEAD) draw_text_c(H * 0.80f, "TRIANGULO: SITIO DE GRACIA", 2, RGB(240, 230, 200));
+    else if (P.state != PS_DEAD && near_poi() >= 0) {
+        char pb[40]; snprintf(pb, sizeof(pb), "TRIANGULO: %s", poi_name[near_poi()]);
+        draw_text_c(H * 0.80f, pb, 2, RGB(240, 230, 200));
+    }
     if (P.lock >= 0 && en[P.lock].alive) {
         float sx, sy; const Enemy *e = &en[P.lock];
         if (project(e->x, e->y + 2.1f * e->scale, e->z, &sx, &sy)) {
@@ -1383,17 +1638,146 @@ static void draw_hud(void)
         if (project(e->x, e->y + 2.3f, e->z, &sx, &sy)) bar(sx - 20, sy - 4, 40, 4, e->hp / e->hpmax, RGB(190, 40, 40), RGB(30, 12, 12));
     }
     if (boss_idx >= 0 && boss_gate_closed && en[boss_idx].alive) {
-        draw_text_c(H - 78.0f, "PRESAGIO CAIDO", 2, RGB(238, 222, 190));
+        draw_text_c(H - 78.0f, bd->name, 2, RGB(238, 222, 190));
         bar(W * 0.5f - 190, H - 56.0f, 380, 11, en[boss_idx].hp / en[boss_idx].hpmax, RGB(190, 36, 36), RGB(40, 14, 14));
     }
+    if (cur_mission >= 0 && boss_dead && clear_t > 1.0f) {
+        static const char *m1 = "MISION COMPLETADA", *m2 = "REGRESANDO AL PUEBLO...";
+        draw_text_sh((W - text_w(m1, 4)) * 0.5f, H * 0.30f, m1, 4, RGB(246, 214, 120));
+        draw_text_sh((W - text_w(m2, 2)) * 0.5f, H * 0.30f + 42.0f, m2, 2, RGB(230, 226, 214));
+    }
     if (P.state == PS_DEAD && P.dead_t > 0.3f) { prim_sprite(0, H * 0.40f, W, H * 0.62f, RGB(0, 0, 0)); draw_text_c(H * 0.44f, "HAS MUERTO", 6, RGB(150, 24, 20)); }
+}
+
+// ---------------- tiendas (se paga con runas) ----------------
+#define FLASK_CAP_COST() (350 + 250 * (P.flask_max - 4))
+#define HEAL_UP_COST()   (300 * (P.heal_lv + 1))
+static void shop_row(int kind, int row, char *o, int n)       // texto de cada fila del menu
+{
+    if (kind == POI_ARMS) {
+        if (row >= 6) { snprintf(o, n, "SALIR"); return; }
+        int armor = row >= 3, t = row % 3 + 1;
+        const Gear *g = armor ? &armors[t] : &weapons[t];
+        int own = armor ? P.aown[t] : P.wown[t], eq = armor ? (P.arm == t) : (P.wpn == t);
+        if (eq) snprintf(o, n, "%s - EQUIPADA", g->name);
+        else if (own) snprintf(o, n, "%s - TUYA", g->name);
+        else snprintf(o, n, "%s - %d", g->name, g->price);
+    } else {
+        if (row == 0) { int miss = P.flask_max - P.flasks; if (miss <= 0) snprintf(o, n, "REPONER LAGRIMAS - LLENAS"); else snprintf(o, n, "REPONER LAGRIMAS - %d", 40 * miss); }
+        else if (row == 1) { if (P.flask_max >= 8) snprintf(o, n, "AMPLIAR FRASCO - MAXIMO"); else snprintf(o, n, "AMPLIAR FRASCO - %d", FLASK_CAP_COST()); }
+        else if (row == 2) { if (P.heal_lv >= 3) snprintf(o, n, "POTENCIA - MAXIMA"); else snprintf(o, n, "MEJORAR POTENCIA - %d", HEAL_UP_COST()); }
+        else snprintf(o, n, "SALIR");
+    }
+}
+static void shop_detail(int kind, int row, char *l1, char *l2, int n)   // dos lineas de ayuda bajo la lista
+{
+    snprintf(l2, n, "RUNAS: %d", P.runes);
+    l1[0] = 0;
+    if (kind == POI_ARMS) {
+        if (row < 3) snprintf(l1, n, "DANO X%.2f   ACTUAL X%.2f", weapons[row + 1].val, weapons[P.wpn].val);
+        else if (row < 6) snprintf(l1, n, "DANO RECIBIDO X%.2f   ACTUAL X%.2f", armors[row - 2].val, armors[P.arm].val);
+    } else {
+        if (row == 0) snprintf(l1, n, "LAGRIMAS %d/%d   CURAN %d", P.flasks, P.flask_max, 150 + 40 * P.heal_lv);
+        else if (row == 1) snprintf(l1, n, "CAPACIDAD %d/8", P.flask_max);
+        else if (row == 2) snprintf(l1, n, "CURAN %d   NIVEL %d/3", 150 + 40 * P.heal_lv, P.heal_lv);
+    }
+}
+static void shop_buy(int kind, int row)
+{
+    int bought = 0, denied = 0;
+    if (kind == POI_ARMS) {
+        if (row >= 6) { ui = UI_PLAY; return; }
+        int armor = row >= 3, t = row % 3 + 1;
+        unsigned char *own = armor ? P.aown : P.wown;
+        int *eq = armor ? &P.arm : &P.wpn;
+        const Gear *g = armor ? &armors[t] : &weapons[t];
+        if (own[t]) { *eq = t; bought = 1; }                       // ya la tienes: equiparla
+        else if (P.runes >= g->price) { P.runes -= g->price; own[t] = 1; *eq = t; bought = 1; }
+        else denied = 1;
+    } else {
+        if (row == 0) {
+            int miss = P.flask_max - P.flasks, cost = 40 * miss;
+            if (miss > 0 && P.runes >= cost) { P.runes -= cost; P.flasks = P.flask_max; bought = 1; } else denied = 1;
+        } else if (row == 1) {
+            if (P.flask_max < 8 && P.runes >= FLASK_CAP_COST()) { P.runes -= FLASK_CAP_COST(); P.flask_max++; P.flasks++; bought = 1; } else denied = 1;
+        } else if (row == 2) {
+            if (P.heal_lv < 3 && P.runes >= HEAL_UP_COST()) { P.runes -= HEAL_UP_COST(); P.heal_lv++; bought = 1; } else denied = 1;
+        } else { ui = UI_PLAY; return; }
+    }
+    if (bought) sfx_play(SFX_GRACE, 0.8f);
+    else if (denied) sfx_play(SFX_BLOCK, 0.5f);
+}
+
+// ---------------- pantalla de carga ----------------
+// begin_load() pasa a UI_LOADING y loading_frame() hace UNA etapa por cuadro
+// (descargar -> nivel -> ruinas -> enemigos -> objetos) mientras dibuja la barra.
+// Asi nunca coexisten el pueblo y el nivel de la mision en memoria. Hoy todo es
+// procedural y tarda milisegundos; LOAD_MIN_T evita que la pantalla parpadee y es
+// el sitio donde iria la carga real (modelos, texturas, audio) cuando la agregues.
+#define LOAD_STAGES 5
+#define LOAD_MIN_T 1.8f
+static int load_id, load_mission, load_stage, load_frames, load_tip, ret_from_clear;
+static float load_t;
+static const char *const tips[] = {
+    "RODAR EN EL MOMENTO JUSTO TE HACE INVULNERABLE",
+    "BLOQUEAR GASTA ESTAMINA: NO TE QUEDES SIN ELLA",
+    "DESCANSA EN UN SITIO DE GRACIA PARA CURARTE",
+    "FIJA AL ENEMIGO CON L1 PARA ESQUIVAR MEJOR",
+    "LOS JEFES AVISAN SUS GOLPES: MIRA SU POSTURA",
+    "SUBE DE NIVEL EN EL SITIO DE GRACIA CON RUNAS",
+};
+static void begin_load(int level_id, int mission)
+{
+    load_id = level_id; load_mission = mission; load_stage = 0; load_frames = 0; load_t = 0.0f;
+    load_tip = (load_tip + 1) % COUNT(tips);
+    ui = UI_LOADING;
+}
+static void enter_level(void)                // jugador al sitio de gracia inicial del nivel actual
+{
+    player_spawn_at_grace(0);
+    P.yaw = orb_yaw = L->spawn_yaw; orb_el = 0.36f;
+    clear_t = 0.0f;
+}
+static void loading_frame(float dt, float t)
+{
+    load_t += dt;
+    if (load_frames++ >= 2 && load_stage < LOAD_STAGES) {      // 2 cuadros de pantalla antes de trabajar
+        switch (load_stage) {
+        case 0: level_unload(); break;
+        case 1: level_select(load_id); break;
+        case 2: level_build_ruins(); break;
+        case 3: level_spawn_enemies(); break;
+        default: level_place_items(); break;
+        }
+        load_stage++;
+    }
+    float shown = fminf(load_stage / (float)LOAD_STAGES, load_t / LOAD_MIN_T);
+    int done = (load_stage >= LOAD_STAGES && load_t >= LOAD_MIN_T);
+    prim_sprite(0, 0, W, H, RGB(16, 13, 10));
+    char buf[32]; int nd = (int)(t * 3.0f) % 4;
+    snprintf(buf, sizeof(buf), "CARGANDO%.*s", nd, "...");
+    draw_text((W - text_w("CARGANDO...", 5)) * 0.5f, H * 0.20f, buf, 5, RGB(240, 206, 100));
+    draw_text_c(H * 0.38f, load_id == LV_VILLAGE ? "PUEBLO DE CENIZA" : missions[load_mission].title, 3, RGB(226, 220, 204));
+    float bw = 360.0f;
+    bar((W - bw) * 0.5f, H * 0.58f, bw, 10.0f, shown, RGB(226, 190, 96), RGB(40, 32, 22));
+    draw_text_c(H - 80.0f, "CONSEJO:", 2, RGB(150, 142, 126));
+    draw_text_c(H - 56.0f, tips[load_tip], 2, RGB(210, 204, 190));
+    if (done) {                                                // nivel listo: entrar a jugar
+        cur_mission = load_mission;
+        enter_level();
+        if (!L->village) set_banner(missions[load_mission].title, 1);
+        else set_banner(ret_from_clear ? "MISION COMPLETADA" : "PUEBLO DE CENIZA", 1);
+        ret_from_clear = 0;
+        sfx_play(SFX_GRACE, 0.7f);
+        ui = UI_PLAY;
+    }
 }
 
 // ---------------- menus ----------------
 static void camera_orbit_menu(float t)
 {
     float a = t * 0.12f;
-    cam_x = sinf(a) * 20.0f; cam_z = 4.0f + cosf(a) * 20.0f; cam_y = terrain_h(cam_x, cam_z) + 6.0f;
+    cam_x = sinf(a) * 14.0f; cam_z = 2.0f + cosf(a) * 14.0f; cam_y = terrain_h(cam_x, cam_z) + 4.5f;
     cam_yaw = atan2f(-sinf(a), -cosf(a)); cam_pit = -0.18f;
 }
 static void menu_frame(unsigned newp, float lv, int frame, float t)
@@ -1403,15 +1787,23 @@ static void menu_frame(unsigned newp, float lv, int frame, float t)
     int up = (newp & PAD_UP) || (sdir == -1 && sprev == 0), dn = (newp & PAD_DOWN) || (sdir == 1 && sprev == 0);
     sprev = sdir;
     int ok = (newp & PAD_CROSS) != 0, back = (newp & PAD_CIRCLE) != 0, lt = (newp & PAD_LEFT) != 0, rt = (newp & PAD_RIGHT) != 0;
-    int n = (ui == UI_OPT) ? 4 : 3;
-    int *sel = (ui == UI_OPT) ? &opt_sel : ((ui == UI_GRACE) ? &grace_sel : &menu_sel);
+    int in_mission = (cur_mission >= 0);
+    int n = 3;
+    if (ui == UI_OPT) n = 4;
+    else if (ui == UI_PAUSE) n = in_mission ? 4 : 3;
+    else if (ui == UI_MISSION) n = NMISSION + 1;
+    else if (ui == UI_SHOP) n = (shop_kind == POI_ARMS) ? 7 : 4;
+    int *sel = (ui == UI_OPT) ? &opt_sel : (ui == UI_GRACE) ? &grace_sel : (ui == UI_MISSION) ? &mission_sel : (ui == UI_SHOP) ? &shop_sel : &menu_sel;
     if (up) { *sel = (*sel + n - 1) % n; sfx_play(SFX_UI, 0.6f); }
     if (dn) { *sel = (*sel + 1) % n; sfx_play(SFX_UI, 0.6f); }
     if (ok || back) sfx_play(SFX_UI, 0.8f);
     int cost = 120 + P.level * 90;
     if (ui == UI_MAIN) {
         if (ok) {
-            if (*sel == 0) { player_reset_stats(); gen_world(); player_spawn_at_grace(0); orb_yaw = 2.3f; ui = UI_PLAY; }
+            if (*sel == 0) {                                   // partida nueva: empiezas en el pueblo
+                player_reset_stats(); memset(mission_done, 0, sizeof(mission_done)); cur_mission = -1;
+                load_level_now(LV_VILLAGE); enter_level(); ui = UI_PLAY;
+            }
             else if (*sel == 1) { opt_from = UI_MAIN; ui = UI_OPT; opt_sel = 0; }
             else Exit(0);
         }
@@ -1420,16 +1812,26 @@ static void menu_frame(unsigned newp, float lv, int frame, float t)
         else if (ok) {
             if (*sel == 0) ui = UI_PLAY;
             else if (*sel == 1) { opt_from = UI_PAUSE; ui = UI_OPT; opt_sel = 0; }
-            else { ui = UI_MAIN; menu_sel = 0; }
+            else if (in_mission && *sel == 2) begin_load(LV_VILLAGE, -1);      // abandonar la mision
+            else { ui = UI_MAIN; menu_sel = 0; cur_mission = -1; if (!L->village) load_level_now(LV_VILLAGE); }
         }
     } else if (ui == UI_GRACE) {
         if (back) ui = UI_PLAY;
         else if (ok) {
-            if (*sel == 0) { P.hp = P.hpmax; P.fp = P.fpmax; P.sta = P.stamax; P.flasks = 4;
+            if (*sel == 0) { P.hp = P.hpmax; P.fp = P.fpmax; P.sta = P.stamax; P.flasks = P.flask_max;
                 respawn_enemies(); set_banner("DESCANSAS EN EL SITIO DE GRACIA", 1); sfx_play(SFX_GRACE, 0.9f); ui = UI_PLAY; }
             else if (*sel == 1 && P.runes >= cost) { P.runes -= cost; P.level++; P.hpmax += 20.0f; P.stamax += 4.0f; P.dmg_mult += 0.06f; P.hp = P.hpmax; sfx_play(SFX_GRACE, 0.7f); }
             else if (*sel == 2) ui = UI_PLAY;
         }
+    } else if (ui == UI_MISSION) {
+        if (back) ui = UI_PLAY;
+        else if (ok) {
+            if (*sel < (int)NMISSION) begin_load(missions[*sel].level, *sel);   // -> pantalla de carga
+            else ui = UI_PLAY;
+        }
+    } else if (ui == UI_SHOP) {
+        if (back) ui = UI_PLAY;
+        else if (ok) shop_buy(shop_kind, *sel);
     } else if (ui == UI_OPT) {
         int d = rt ? 1 : (lt ? -1 : (ok ? 1 : 0));
         if (back || (ok && *sel == 3)) ui = opt_from;
@@ -1439,24 +1841,37 @@ static void menu_frame(unsigned newp, float lv, int frame, float t)
             else if (*sel == 2) { vol_lv += d; if (vol_lv > 5) vol_lv = ok ? 1 : 5; if (vol_lv < 1) vol_lv = 1; }
         }
     }
+    if (ui == UI_LOADING) return;                              // main() dibuja la pantalla de carga
+    if (ui == UI_PLAY) { render_scene(t); return; }
     if (ui == UI_MAIN || (ui == UI_OPT && opt_from == UI_MAIN)) {
         camera_orbit_menu(t);
-        if (!nboxes) { player_reset_stats(); gen_world(); player_spawn_at_grace(0); }
+        if (!nboxes) { player_reset_stats(); load_level_now(LV_VILLAGE); enter_level(); }
     }
     render_scene(t);
     u64 sel_c = RGB(250, 226, 130), norm_c = RGB(200, 196, 188);
-    static char line[56];
+    static char line[64];
     const char *title = "TIERRAS DE CENIZA"; int tsc = 5;
-    if (ui == UI_PAUSE) { title = "PAUSA"; tsc = 6; } else if (ui == UI_OPT) { title = "OPCIONES"; tsc = 5; } else if (ui == UI_GRACE) { title = "SITIO DE GRACIA"; tsc = 4; }
+    if (ui == UI_PAUSE) { title = "PAUSA"; tsc = 6; } else if (ui == UI_OPT) { title = "OPCIONES"; tsc = 5; }
+    else if (ui == UI_GRACE) { title = "SITIO DE GRACIA"; tsc = 4; } else if (ui == UI_MISSION) { title = "GREMIO DE MISIONES"; tsc = 4; } else if (ui == UI_SHOP) { title = poi_name[shop_kind]; tsc = 5; }
     prim_sprite(0, 36.0f, W, 36.0f + 7.0f * tsc + 16.0f, RGB(10, 8, 6));
     draw_text_c(44.0f, title, tsc, ui == UI_MAIN ? RGB(240, 206, 100) : sel_c);
-    int cnt = (ui == UI_OPT) ? 4 : 3;
-    prim_sprite(W * 0.5f - 210.0f, 170.0f, W * 0.5f + 210.0f, 170.0f + cnt * 44.0f + 10.0f, RGB(10, 8, 6));
+    int cnt = n, shop = (ui == UI_SHOP), rowh = shop ? 30 : (ui == UI_MISSION ? 36 : 44), isc = (shop || ui == UI_MISSION) ? 2 : 3;
+    float pw = (shop || ui == UI_MISSION) ? 270.0f : 210.0f, top = shop ? 100.0f : 170.0f;
+    prim_sprite(W * 0.5f - pw, top, W * 0.5f + pw, top + cnt * rowh + 10.0f, RGB(10, 8, 6));
     for (int i = 0; i < cnt; i++) {
         const char *s = ""; char tmp[40];
         if (ui == UI_MAIN) { static const char *it[3] = { "JUGAR", "OPCIONES", "SALIR" }; s = it[i]; }
-        else if (ui == UI_PAUSE) { static const char *it[3] = { "REANUDAR", "OPCIONES", "MENU PRINCIPAL" }; s = it[i]; }
+        else if (ui == UI_PAUSE) {
+            static const char *itv[3] = { "REANUDAR", "OPCIONES", "MENU PRINCIPAL" };
+            static const char *itm[4] = { "REANUDAR", "OPCIONES", "ABANDONAR MISION", "MENU PRINCIPAL" };
+            s = in_mission ? itm[i] : itv[i];
+        }
         else if (ui == UI_GRACE) { if (i == 0) s = "DESCANSAR"; else if (i == 1) { snprintf(tmp, sizeof(tmp), "SUBIR NIVEL  %d", cost); s = tmp; } else s = "CERRAR"; }
+        else if (ui == UI_SHOP) { shop_row(shop_kind, i, tmp, sizeof(tmp)); s = tmp; }
+        else if (ui == UI_MISSION) {
+            if (i < (int)NMISSION) { snprintf(tmp, sizeof(tmp), "%s%s", missions[i].title, mission_done[i] ? "  - HECHA" : ""); s = tmp; }
+            else s = "VOLVER";
+        }
         else {
             static const char *gq[3] = { "BAJO", "MEDIO", "ALTO" };
             if (i == 0) snprintf(tmp, sizeof(tmp), "GRAFICOS: %s", gq[gfx]);
@@ -1466,9 +1881,29 @@ static void menu_frame(unsigned newp, float lv, int frame, float t)
             s = tmp;
         }
         snprintf(line, sizeof(line), i == *sel ? "> %s <" : "%s", s);
-        draw_text_c(178.0f + i * 44.0f, line, 3, i == *sel ? sel_c : norm_c);
+        draw_text_c(top + 8.0f + i * rowh, line, isc, i == *sel ? sel_c : norm_c);
     }
-    draw_text_c(H - 30.0f, ui == UI_OPT ? "IZQ/DER: CAMBIAR   O: ATRAS" : "ARRIBA/ABAJO: MOVER   X: ELEGIR", 2, RGB(190, 186, 176));
+    if (shop) {                                                // ayuda y saldo de runas
+        char l1[56], l2[56];
+        shop_detail(shop_kind, *sel, l1, l2, sizeof(l1));
+        float by = top + cnt * rowh + 22.0f;
+        prim_sprite(W * 0.5f - 290.0f, by, W * 0.5f + 290.0f, by + 60.0f, RGB(10, 8, 6));
+        draw_text_c(by + 8.0f, l1, 2, norm_c);
+        draw_text_c(by + 34.0f, l2, 2, RGB(240, 206, 100));
+    }
+    if (ui == UI_MISSION && *sel < (int)NMISSION) {            // ficha de la mision elegida
+        const Mission *m = &missions[*sel];
+        float by = 170.0f + cnt * rowh + 22.0f;
+        prim_sprite(W * 0.5f - 290.0f, by, W * 0.5f + 290.0f, by + 92.0f, RGB(10, 8, 6));
+        draw_text_c(by + 8.0f, m->d1, 2, norm_c);
+        draw_text_c(by + 30.0f, m->d2, 2, norm_c);
+        snprintf(line, sizeof(line), "JEFE: %s", bosses[levels[m->level].boss].name);
+        draw_text_c(by + 58.0f, line, 2, RGB(230, 90, 80));
+    }
+    draw_text_c(H - 30.0f, ui == UI_OPT ? "IZQ/DER: CAMBIAR   O: ATRAS"
+                         : (ui == UI_MISSION ? "ARRIBA/ABAJO: MOVER   X: ACEPTAR   O: VOLVER"
+                         : (ui == UI_SHOP ? "ARRIBA/ABAJO: MOVER   X: COMPRAR   O: SALIR" : "ARRIBA/ABAJO: MOVER   X: ELEGIR")),
+                2, RGB(190, 186, 176));
     draw_fps();
     (void)frame;
 }
@@ -1527,12 +1962,13 @@ int main(void)
     gsKit_set_test(gsGlobal, GS_ZTEST_ON);
     W = (float)gsGlobal->Width; H = (float)gsGlobal->Height; FOCAL = W * 0.85f;
 
+    set_fog(206.0f, 184.0f, 138.0f);
     gsKit_clear(gsGlobal, SKYCOL);                       // primer cuadro (nunca pantalla negra)
     draw_text_c(H * 0.5f - 10.0f, "CARGANDO...", 3, RGB(60, 48, 30));
     gsKit_queue_exec(gsGlobal); gsKit_sync_flip(gsGlobal);
     audio_init();
 
-    player_reset_stats(); gen_world(); player_spawn_at_grace(0);
+    player_reset_stats(); load_level_now(LV_VILLAGE); enter_level();     // arrancamos en el pueblo
 #ifdef HEADLESS_FRAMES
     ui = UI_PLAY;
 #endif
@@ -1556,7 +1992,8 @@ int main(void)
         gsKit_clear(gsGlobal, SKYCOL);
 
         if (ui != UI_PLAY) {
-            menu_frame(in.newp, in.lv, frame_no, t);
+            if (ui != UI_LOADING) menu_frame(in.newp, in.lv, frame_no, t);
+            if (ui == UI_LOADING) loading_frame(dt, t);
             audio_update();
             gsKit_queue_exec(gsGlobal); gsKit_sync_flip(gsGlobal);
             continue;
@@ -1569,6 +2006,10 @@ int main(void)
             if (gi >= 0) {
                 if (!graces[gi].active) { graces[gi].active = 1; set_banner("SITIO DE GRACIA DESCUBIERTO", 1); sfx_play(SFX_GRACE, 0.9f); }
                 P.respawn_grace = gi; ui = UI_GRACE; grace_sel = 0;
+            } else {
+                int pk = near_poi();
+                if (pk == POI_MISSION) { ui = UI_MISSION; mission_sel = 0; sfx_play(SFX_UI, 0.8f); }
+                else if (pk >= 0) { ui = UI_SHOP; shop_kind = pk; shop_sel = 0; sfx_play(SFX_UI, 0.8f); }
             }
         }
         for (int i = 0; i < npk; i++) {
@@ -1582,6 +2023,10 @@ int main(void)
             boss_gate_closed = 1; en[boss_idx].aggro = 1; set_banner("LA NIEBLA SE CIERRA", 0); sfx_play(SFX_ROAR, 0.8f);
         }
         if (P.state == PS_DEAD) boss_gate_closed = 0;
+        if (cur_mission >= 0 && boss_dead && P.state != PS_DEAD) {          // jefe caido: de vuelta al pueblo
+            clear_t += dt;
+            if (clear_t > 6.0f) { ret_from_clear = 1; begin_load(LV_VILLAGE, -1); }
+        }
         for (int i = 0; i < nen; i++) enemy_update(&en[i], dt);
         camera_update(&in, dt);
         render_scene(t);
